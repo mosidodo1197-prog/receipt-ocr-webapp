@@ -69,12 +69,14 @@ def extract_receipt_rows(client, file_bytes, filename):
         headers=headers,
         files={"document": (filename, io.BytesIO(file_bytes))},
         data={"model": "ocr"},
+        timeout=60,
     )
     ocr_response.raise_for_status()
     ocr_text = ocr_response.json()["text"]
 
     llm_response = client.chat.completions.create(
         model="solar-mini",
+        timeout=60,
         messages=[
             {
                 "role": "system",
@@ -160,14 +162,16 @@ if st.button("분석하기", type="primary", disabled=not uploaded_files):
 
     all_rows = []
     progress = st.progress(0.0)
+    status_area = st.empty()
     for i, uploaded_file in enumerate(uploaded_files):
-        with st.spinner(f"{uploaded_file.name} 처리 중..."):
-            try:
-                rows = extract_receipt_rows(client, uploaded_file.getvalue(), uploaded_file.name)
-                all_rows.extend(rows)
-            except Exception as e:
-                st.warning(f"{uploaded_file.name} 처리 실패: {e}")
+        status_area.info(f"({i + 1}/{len(uploaded_files)}) {uploaded_file.name} 처리 중...")
+        try:
+            rows = extract_receipt_rows(client, uploaded_file.getvalue(), uploaded_file.name)
+            all_rows.extend(rows)
+        except Exception as e:
+            st.warning(f"{uploaded_file.name} 처리 실패: {e}")
         progress.progress((i + 1) / len(uploaded_files))
+    status_area.empty()
 
     if all_rows:
         st.session_state["result_df"] = pd.DataFrame(all_rows, columns=RESULT_COLUMNS)
