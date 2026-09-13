@@ -38,23 +38,44 @@ OCR_URL = "https://api.upstage.ai/v1/document-digitization"
 RECEIPT_SCHEMA = {
     "type": "object",
     "properties": {
-        "store_name": {"type": "string", "description": "가게(매장) 이름. 반드시 원문 텍스트에 있는 글자 그대로 옮겨 적을 것"},
-        "purchase_datetime": {"type": "string", "description": "구매 일시"},
+        "store_name": {
+            "type": "string",
+            "description": "가게(매장) 이름. 반드시 원문 텍스트에 있는 글자 그대로 옮겨 적을 것. "
+            "원문에 명확히 나와있지 않으면 절대 지어내지 말고 빈 문자열(\"\")로 둘 것",
+        },
+        "purchase_datetime": {
+            "type": "string",
+            "description": "구매 일시. 원문에 명확히 나와있지 않으면 절대 지어내지 말고 빈 문자열(\"\")로 둘 것",
+        },
         "items": {
             "type": "array",
-            "description": "구매한 물품 목록",
+            "description": "구매한 물품(또는 거래 내역) 목록",
             "items": {
                 "type": "object",
                 "properties": {
-                    "item_name": {"type": "string", "description": "수량, 단가 표기를 제외한 순수 물품명"},
-                    "quantity": {"type": "number", "description": "구매 수량"},
-                    "unit_price": {"type": "number", "description": "물품 1개당 단가"},
+                    "item_name": {
+                        "type": "string",
+                        "description": "수량, 단가 표기를 제외한 순수 물품명. "
+                        "정확한 물품명을 모르면 원문에 있는 가맹점명/설명을 그대로 사용하고, 지어내지 말 것",
+                    },
+                    "quantity": {
+                        "type": "number",
+                        "description": "구매 수량. 수량 정보가 원문에 명확히 없으면 반드시 1로 설정할 것 (0이나 음수 금지)",
+                    },
+                    "unit_price": {
+                        "type": "number",
+                        "description": "물품 1개당 단가. 단가를 따로 알 수 없고 총 금액만 있는 경우, "
+                        "quantity를 1로 하고 이 필드에 해당 항목의 실제 금액을 그대로 넣을 것",
+                    },
                 },
                 "required": ["item_name", "quantity", "unit_price"],
                 "additionalProperties": False,
             },
         },
-        "total_amount": {"type": "number", "description": "총 구매금액"},
+        "total_amount": {
+            "type": "number",
+            "description": "총 구매금액. 명확한 합계가 없으면 items 금액의 합으로 계산할 것",
+        },
     },
     "required": ["store_name", "purchase_datetime", "items", "total_amount"],
     "additionalProperties": False,
@@ -87,10 +108,14 @@ def call_with_retry(fn, max_retries=5, base_delay=3):
 
 def fix_store_name(store_name, ocr_text):
     """LLM이 가끔 가게이름을 엉뚱하게 지어내는 경우(예: 이상한 한글 조합)를 보정.
-    OCR 원문에 실제로 등장하는 문자열인지 확인하고, 아니면 원문 첫 줄(대개 가게이름)로 대체"""
+    LLM이 이미 빈 문자열(모름)로 답했다면 그대로 존중하고,
+    무언가 적었는데 원문에 없는 내용이면(=지어낸 것) 원문 첫 줄로 대체"""
+    if not store_name:
+        return ""  # LLM이 "모른다"고 판단한 경우 그대로 존중
+
     normalized_text = ocr_text.replace(" ", "")
-    normalized_name = (store_name or "").replace(" ", "")
-    if normalized_name and normalized_name in normalized_text:
+    normalized_name = store_name.replace(" ", "")
+    if normalized_name in normalized_text:
         return store_name
 
     first_line = ocr_text.strip().splitlines()[0].strip() if ocr_text.strip() else store_name
@@ -163,7 +188,11 @@ def extract_receipt_rows(client, file_bytes, filename):
                     "role": "system",
                     "content": "너는 영수증 OCR 텍스트에서 정보를 정확하게 추출하는 도우미야. "
                     "원문에 있는 글자를 절대 지어내지 말고 그대로 옮겨 적어. "
-                    "물품명(item_name)에는 수량이나 가격 표기를 포함하지 말고 순수 상품명만 넣어.",
+                    "확실하지 않은 정보는 절대 추측해서 만들어내지 마. "
+                    "가게이름이나 구매일시를 원문에서 확인할 수 없으면 빈 문자열로 남겨. "
+                    "물품명(item_name)에는 수량이나 가격 표기를 포함하지 말고 순수 상품명만 넣어. "
+                    "수량 정보가 명확하지 않으면 quantity는 반드시 1로 설정하고, "
+                    "unit_price에는 그 항목의 실제 금액을 그대로 넣어서 금액 계산이 맞도록 해.",
                 },
                 {"role": "user", "content": ocr_text},
             ],
