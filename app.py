@@ -6,6 +6,7 @@
 import io
 import json
 import os
+import time
 
 import openpyxl
 import pandas as pd
@@ -36,7 +37,7 @@ OCR_URL = "https://api.upstage.ai/v1/document-digitization"
 RECEIPT_SCHEMA = {
     "type": "object",
     "properties": {
-        "store_name": {"type": "string", "description": "가게(매장) 이름"},
+        "store_name": {"type": "string", "description": "가게(매장) 이름. 반드시 원문 텍스트에 있는 글자 그대로 옮겨 적을 것"},
         "purchase_datetime": {"type": "string", "description": "구매 일시"},
         "items": {
             "type": "array",
@@ -61,41 +62,86 @@ RECEIPT_SCHEMA = {
 RESULT_COLUMNS = ["파일명", "가게이름", "구매일시", "물품명", "수량", "단가", "금액", "총 구매금액"]
 
 
+def call_with_retry(fn, max_retries=5, base_delay=3):
+    """429(Too Many Requests)를 만나면 잠시 대기 후 자동 재시도"""
+    for attempt in range(max_retries):
+        try:
+            return fn()
+        except Exception as e:
+            status_code = getattr(e, "status_code", None)
+            response = getattr(e, "response", None)
+            if status_code is None and response is not None:
+                status_code = getattr(response, "status_code", None)
+
+            is_last_attempt = attempt == max_retries - 1
+            if status_code == 429 and not is_last_attempt:
+                retry_after = None
+                if response is not None:
+                    retry_after = response.headers.get("Retry-After")
+                delay = float(retry_after) if retry_after else base_delay * (2 ** attempt)
+                time.sleep(delay)
+                continue
+            raise
+
+
+def fix_store_name(store_name, ocr_text):
+    """LLM이 가끔 가게이름을 엉뚱하게 지어내는 경우(예: 이상한 한글 조합)를 보정.
+    OCR 원문에 실제로 등장하는 문자열인지 확인하고, 아니면 원문 첫 줄(대개 가게이름)로 대체"""
+    normalized_text = ocr_text.replace(" ", "")
+    normalized_name = (store_name or "").replace(" ", "")
+    if normalized_name and normalized_name in normalized_text:
+        return store_name
+
+    first_line = ocr_text.strip().splitlines()[0].strip() if ocr_text.strip() else store_name
+    return first_line
+
+
 def extract_receipt_rows(client, file_bytes, filename):
     """영수증 이미지(메모리 바이트) 1개를 OCR + LLM으로 처리하여 물품별 행 리스트를 반환"""
     headers = {"Authorization": f"Bearer {UPSTAGE_API_KEY}"}
-    ocr_response = requests.post(
-        OCR_URL,
-        headers=headers,
-        files={"document": (filename, io.BytesIO(file_bytes))},
-        data={"model": "ocr"},
-        timeout=60,
-    )
-    ocr_response.raise_for_status()
+
+    def do_ocr():
+        resp = requests.post(
+            OCR_URL,
+            headers=headers,
+            files={"document": (filename, io.BytesIO(file_bytes))},
+            data={"model": "ocr"},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        return resp
+
+    ocr_response = call_with_retry(do_ocr)
     ocr_text = ocr_response.json()["text"]
 
-    llm_response = client.chat.completions.create(
-        model="solar-mini",
-        timeout=60,
-        messages=[
-            {
-                "role": "system",
-                "content": "너는 영수증 OCR 텍스트에서 정보를 정확하게 추출하는 도우미야. "
-                "물품명(item_name)에는 수량이나 가격 표기를 포함하지 말고 순수 상품명만 넣어.",
+    def do_llm():
+        return client.chat.completions.create(
+            model="solar-mini",
+            timeout=60,
+            temperature=0,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "너는 영수증 OCR 텍스트에서 정보를 정확하게 추출하는 도우미야. "
+                    "원문에 있는 글자를 절대 지어내지 말고 그대로 옮겨 적어. "
+                    "물품명(item_name)에는 수량이나 가격 표기를 포함하지 말고 순수 상품명만 넣어.",
+                },
+                {"role": "user", "content": ocr_text},
+            ],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {"name": "receipt_info", "schema": RECEIPT_SCHEMA, "strict": True},
             },
-            {"role": "user", "content": ocr_text},
-        ],
-        response_format={
-            "type": "json_schema",
-            "json_schema": {"name": "receipt_info", "schema": RECEIPT_SCHEMA, "strict": True},
-        },
-    )
+        )
+
+    llm_response = call_with_retry(do_llm)
     info = json.loads(llm_response.choices[0].message.content)
+    store_name = fix_store_name(info["store_name"], ocr_text)
 
     return [
         {
             "파일명": filename,
-            "가게이름": info["store_name"],
+            "가게이름": store_name,
             "구매일시": info["purchase_datetime"],
             "물품명": item["item_name"],
             "수량": item["quantity"],
@@ -171,6 +217,8 @@ if st.button("분석하기", type="primary", disabled=not uploaded_files):
         except Exception as e:
             st.warning(f"{uploaded_file.name} 처리 실패: {e}")
         progress.progress((i + 1) / len(uploaded_files))
+        if i < len(uploaded_files) - 1:
+            time.sleep(1)  # 연속 호출로 인한 429(Too Many Requests) 예방
     status_area.empty()
 
     if all_rows:
