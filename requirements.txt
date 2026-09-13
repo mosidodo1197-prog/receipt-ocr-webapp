@@ -1,0 +1,7 @@
+streamlit
+openai==1.52.2
+httpx==0.27.2
+requests
+python-dotenv
+pandas
+openpyxl
