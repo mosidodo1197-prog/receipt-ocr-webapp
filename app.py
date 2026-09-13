@@ -6,6 +6,7 @@
 import io
 import json
 import os
+import re
 import time
 
 import openpyxl
@@ -96,6 +97,44 @@ def fix_store_name(store_name, ocr_text):
     return first_line
 
 
+ITEM_LINE_PATTERN = re.compile(r"^(.*\S)\s+(\d+)\s+([\d,]+)\s+([\d,]+)\s*$")
+
+
+def parse_ocr_item_candidates(ocr_text):
+    """OCR 텍스트에서 '물품명 수량 단가 금액' 형태의 줄을 찾아 후보 목록으로 반환"""
+    candidates = []
+    for line in ocr_text.splitlines():
+        match = ITEM_LINE_PATTERN.match(line.strip())
+        if not match:
+            continue
+        name, qty, price, amount = match.groups()
+        try:
+            candidates.append(
+                {
+                    "name": name.strip(),
+                    "quantity": int(qty),
+                    "unit_price": int(price.replace(",", "")),
+                }
+            )
+        except ValueError:
+            continue
+    return candidates
+
+
+def fix_item_name(item_name, quantity, unit_price, ocr_text, candidates):
+    """LLM이 물품명을 엉뚱하게 지어내는 경우를 보정.
+    OCR 원문에 없는 이름이면, 같은 수량·단가를 가진 원문 줄에서 실제 물품명을 찾아 대체"""
+    normalized_text = ocr_text.replace(" ", "")
+    normalized_name = (item_name or "").replace(" ", "")
+    if normalized_name and normalized_name in normalized_text:
+        return item_name
+
+    for candidate in candidates:
+        if candidate["quantity"] == quantity and candidate["unit_price"] == round(unit_price):
+            return candidate["name"]
+    return item_name  # 매칭되는 원문 줄을 못 찾으면 원래 값 유지
+
+
 def extract_receipt_rows(client, file_bytes, filename):
     """영수증 이미지(메모리 바이트) 1개를 OCR + LLM으로 처리하여 물품별 행 리스트를 반환"""
     headers = {"Authorization": f"Bearer {UPSTAGE_API_KEY}"}
@@ -137,13 +176,14 @@ def extract_receipt_rows(client, file_bytes, filename):
     llm_response = call_with_retry(do_llm)
     info = json.loads(llm_response.choices[0].message.content)
     store_name = fix_store_name(info["store_name"], ocr_text)
+    item_candidates = parse_ocr_item_candidates(ocr_text)
 
     return [
         {
             "파일명": filename,
             "가게이름": store_name,
             "구매일시": info["purchase_datetime"],
-            "물품명": item["item_name"],
+            "물품명": fix_item_name(item["item_name"], item["quantity"], item["unit_price"], ocr_text, item_candidates),
             "수량": item["quantity"],
             "단가": item["unit_price"],
             "금액": round(item["quantity"] * item["unit_price"], 2),
